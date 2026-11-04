@@ -13,9 +13,30 @@ use App\Interface\OsStatusInterface;
 use Illuminate\Support\Facades\Mail;
 use App\Mail\OrcamentoAguardandoAprovacao;
 use App\Mail\OrcamentoAprovado;
+use App\Http\Service\ServicoInterno;
 
 class OrdemServicoController extends Controller
 {
+    public function publicoAssinado(Request $request, string $id)
+    {
+        $secret = (string) config('services.os_approval_secret');
+        $signature = (string) $request->query('signature', '');
+        abort_if($secret === '' || $signature === '' || !hash_equals(hash_hmac('sha256', $id, $secret), $signature), 403, 'Assinatura inválida.');
+        $os = OrdemServico::where('osid', $id)->first();
+        abort_if(!$os, 404, 'OS não encontrada.');
+        return response()->json([
+            'os' => [
+                'osid' => $os->osid, 'nome_cliente' => $os->cliente_nome_snapshot,
+                'modelo' => $os->veiculo_modelo_snapshot, 'sintomas' => $os->sintomas,
+                'analise' => $os->analise, 'valor_total' => $os->valor_total,
+            ],
+            'itens' => $os->itens()->get()->map(fn ($item) => [
+                'id' => $item->estoqid, 'descricao' => $item->descricao_snapshot,
+                'qtd' => $item->quantidade, 'preco' => $item->valor_unitario,
+            ]),
+        ]);
+    }
+
     public function store(Request $request)
     {
         $validator = Validator::make($request->all(), [
@@ -30,26 +51,63 @@ class OrdemServicoController extends Controller
             return response()->json(['errors' => $validator->errors()], 422);
         }
 
-        return DB::transaction(function () use ($request) {
+        $servicos = app(ServicoInterno::class);
+        $itensEntrada = collect($request->itens)->map(fn ($item) => is_array($item) ? $item : json_decode($item, true));
+        if ($itensEntrada->contains(fn ($item) => !is_array($item) || empty($item['id']) || !is_numeric($item['qtd'] ?? null) || (int) $item['qtd'] <= 0 || (float) $item['qtd'] !== (float) (int) $item['qtd'])) {
+            return response()->json(['message' => 'Itens inválidos: informe o ID e uma quantidade positiva.'], 422);
+        }
+        $itensEntrada = $itensEntrada->groupBy('id')->map(fn ($group, $itemId) => [
+            'id' => (int) $itemId, 'qtd' => $group->sum('qtd'),
+        ])->values();
+        $clientes = $servicos->consultar('cliente', '/api/internal/v1/clientes', ['ids' => [$request->clientid]]);
+        $veiculos = $servicos->consultar('veiculo', '/api/internal/v1/veiculos', ['ids' => [$request->carid]]);
+        $funcionarios = $servicos->consultar('funcionario', '/api/internal/v1/funcionarios', ['ids' => [$request->funcid]]);
+        $idsEstoque = $itensEntrada->pluck('id')->map(fn ($id) => (int) $id)->unique()->values()->all();
+        $itensEstoque = $servicos->consultar('estoque', '/api/internal/v1/itens-estoque', ['ids' => $idsEstoque]);
+        $cliente = $clientes[0] ?? null;
+        $veiculo = $veiculos[0] ?? null;
+        $funcionario = $funcionarios[0] ?? null;
+        if (!$cliente || !$veiculo || (int) $veiculo['clientid'] !== (int) $request->clientid || !$funcionario || count($itensEstoque) !== count($idsEstoque)) {
+            return response()->json(['message' => 'Uma ou mais referências de cliente, veículo, mecânico ou estoque são inválidas.'], 422);
+        }
+        $estoquePorId = collect($itensEstoque)->keyBy('estoqid');
+        $valorTotal = 0;
+        foreach ($itensEntrada as $item) {
+            $itemEstoque = $estoquePorId[$item['id']] ?? null;
+            if (!$itemEstoque || ($itemEstoque['tipo'] === 'peca' && (int) $itemEstoque['quantidade_atual'] < (int) $item['qtd'])) {
+                return response()->json(['message' => 'Item de estoque indisponível na quantidade solicitada.'], 409);
+            }
+            $valorTotal += (float) $itemEstoque['valor_venda'] * (int) $item['qtd'];
+        }
+
+        $osid = DB::transaction(function () use ($request, $cliente, $veiculo, $funcionario, $itensEntrada, $estoquePorId, $valorTotal) {
 
             $os = OrdemServico::create([
                 'clientid'  => $request->clientid,
                 'carid'     => $request->carid,
                 'funcid'    => $request->funcid,
                 'sintomas'  => $request->sintomas,
-                'valor_total' => $request->valor_total,
+                'valor_total' => $valorTotal,
                 'status_atual' => 'Recebida',
-                'statid_atual' => 1
+                'statid_atual' => 1,
+                'cliente_nome_snapshot' => $cliente['nome'],
+                'cliente_email_snapshot' => $cliente['email'] ?? null,
+                'veiculo_modelo_snapshot' => $veiculo['modelo'],
+                'veiculo_placa_snapshot' => $veiculo['placa'],
+                'funcionario_nome_snapshot' => $funcionario['nome']
             ]);
 
-            foreach ($request->itens as $itemJson) {
-                $item = is_array($itemJson) ? $itemJson : json_decode($itemJson, true);
+            foreach ($itensEntrada as $item) {
+                $itemEstoque = $estoquePorId[$item['id']] ?? null;
+                if (!$itemEstoque) abort(422, 'Item de estoque indisponível.');
+                $preco = $itemEstoque['valor_venda'];
 
                 $os->itens()->create([
                     'estoqid'        => $item['id'],
                     'quantidade'     => $item['qtd'],
-                    'valor_unitario' => $item['preco'],
-                    'subtotal'       => $item['qtd'] * $item['preco']
+                    'valor_unitario' => $preco,
+                    'subtotal'       => $item['qtd'] * $preco,
+                    'descricao_snapshot' => $itemEstoque['descricao']
                 ]);
             }
 
@@ -57,54 +115,51 @@ class OrdemServicoController extends Controller
                 'statid' => 1
             ]);
 
-            return response()->json([
-                'message' => 'Ordem de Serviço criada com sucesso!',
-                'osid'    => $os->osid
-            ], 201);
+            return $os->osid;
         });
+
+        $idempotencyKey = (string) \Illuminate\Support\Str::uuid();
+        try {
+            $servicos->ajustarEstoque($itensEntrada->map(fn ($item) => [
+                'id' => (int) $item['id'], 'qtd' => (int) $item['qtd'],
+            ])->all(), $idempotencyKey);
+        } catch (\Throwable $exception) {
+            DB::transaction(function () use ($osid) {
+                $os = OrdemServico::where('osid', $osid)->first();
+                if ($os) {
+                    $os->itens()->delete();
+                    $os->historicoStatus()->delete();
+                    $os->delete();
+                }
+            });
+            throw $exception;
+        }
+
+        return response()->json(['message' => 'Ordem de Serviço criada com sucesso!', 'osid' => $osid], 201);
     }
 
     public function listar()
     {
-        $os = OrdemServico::join('clientes', 'clientes.clientid', '=', 'os.clientid')
-                            ->join('veiculos', 'veiculos.carid', '=', 'os.carid')
-                            ->join('funcionarios', 'funcionarios.funcid', '=', 'os.funcid')
-                            ->get(['os.*', 'clientes.nome as nome_cliente', 'veiculos.modelo', 'funcionarios.nome as nome_funcionario']);
+        $os = $this->listarComSnapshots(OrdemServico::query());
         return response()->json($os);
     }
 
     public function buscarPorId(string $id)
     {
-        $os = OrdemServico::join('clientes', 'clientes.clientid', '=', 'os.clientid')
-            ->join('veiculos', 'veiculos.carid', '=', 'os.carid')
-            ->join('funcionarios', 'funcionarios.funcid', '=', 'os.funcid')
-            ->where('os.osid', $id)
-            ->select([
-                'os.*',
-                'clientes.nome as nome_cliente',
-                'clientes.clientid',
-                'veiculos.carid',
-                'veiculos.modelo',
-                'veiculos.placa',
-                'funcionarios.nome as nome_mecanico',
-                'funcionarios.funcid'
-            ])
-            ->first();
+        $os = OrdemServico::where('osid', $id)->first();
 
         if (!$os) {
             return response()->json(['message' => 'OS não encontrada'], 404);
         }
 
-        $itens = DB::table('os_itens')
-            ->join('estoque', 'os_itens.estoqid', '=', 'estoque.estoqid')
-            ->where('osid', $id)
-            ->select([
-                'estoque.estoqid as id',
-                'estoque.descricao',
-                'os_itens.quantidade as qtd',
-                'os_itens.valor_unitario as preco'
-            ])
-            ->get();
+        $itens = $os->itens()->get()->map(fn ($item) => [
+            'id' => $item->estoqid, 'descricao' => $item->descricao_snapshot,
+            'qtd' => $item->quantidade, 'preco' => $item->valor_unitario,
+        ]);
+        $os->nome_cliente = $os->cliente_nome_snapshot;
+        $os->modelo = $os->veiculo_modelo_snapshot;
+        $os->placa = $os->veiculo_placa_snapshot;
+        $os->nome_funcionario = $os->funcionario_nome_snapshot;
 
         return response()->json([
             'os' => $os,
@@ -120,22 +175,89 @@ class OrdemServicoController extends Controller
             return response()->json(['message' => "Ordem de Serviço $id não encontrada"], 404);
         }
 
+        $clientId = (int) $request->input('clientid', $os->clientid);
+        $carId = (int) $request->input('carid', $os->carid);
+        $employeeId = (int) $request->input('funcid', $os->funcid);
+        $services = app(ServicoInterno::class);
+        $client = $services->consultar('cliente', '/api/internal/v1/clientes', ['ids' => [$clientId]])[0] ?? null;
+        $vehicle = $services->consultar('veiculo', '/api/internal/v1/veiculos', ['ids' => [$carId]])[0] ?? null;
+        $employee = $services->consultar('funcionario', '/api/internal/v1/funcionarios', ['ids' => [$employeeId]])[0] ?? null;
+        if (!$client || !$vehicle || (int) $vehicle['clientid'] !== $clientId || !$employee) {
+            return response()->json(['message' => 'Referências de cliente, veículo ou mecânico inválidas.'], 422);
+        }
+        $itensEnviados = $request->has('itens')
+            ? collect($request->itens)->map(fn ($item) => is_array($item) ? $item : json_decode($item, true))
+            : collect();
+        if ($request->has('itens') && $itensEnviados->isEmpty()) {
+            return response()->json(['message' => 'A OS precisa conter ao menos um item.'], 422);
+        }
+        if ($itensEnviados->contains(fn ($item) => !is_array($item) || empty($item['id']) || !is_numeric($item['qtd'] ?? null) || (int) $item['qtd'] <= 0 || (float) $item['qtd'] !== (float) (int) $item['qtd'])) {
+            return response()->json(['message' => 'Itens inválidos.'], 422);
+        }
+        if ($request->has('itens')) {
+            $itensEnviados = $itensEnviados->groupBy('id')->map(fn ($group, $itemId) => [
+                'id' => (int) $itemId, 'qtd' => $group->sum('qtd'),
+            ])->values();
+        }
+        $stockById = collect();
+        $total = $os->valor_total;
+        if ($request->has('itens')) {
+            $stockIds = $itensEnviados->pluck('id')->map(fn ($itemId) => (int) $itemId)->unique()->values()->all();
+            $stockItems = $services->consultar('estoque', '/api/internal/v1/itens-estoque', ['ids' => $stockIds, 'include_archived' => true]);
+            if (count($stockItems) !== count($stockIds)) return response()->json(['message' => 'Item de estoque inválido ou arquivado.'], 422);
+            $stockById = collect($stockItems)->keyBy('estoqid');
+            $total = 0;
+            foreach ($itensEnviados as $item) {
+                $stock = $stockById[$item['id']] ?? null;
+                if (!$stock) return response()->json(['message' => 'Item de estoque não encontrado.'], 422);
+                $total += (float) $stock['valor_venda'] * (int) $item['qtd'];
+            }
+        }
+
+        $currentById = $os->itens()->get()->groupBy('estoqid')->map(fn ($group) => $group->sum('quantidade'));
+        $desiredById = $request->has('itens')
+            ? $itensEnviados->groupBy('id')->map(fn ($group) => $group->sum('qtd'))
+            : $currentById;
+        $adjustments = [];
+        foreach ($currentById->keys()->merge($desiredById->keys())->unique() as $stockId) {
+            $difference = (int) $desiredById->get($stockId, 0) - (int) $currentById->get($stockId, 0);
+            if ($difference === 0) continue;
+            $stock = $stockById[$stockId] ?? null;
+            if ($difference > 0 && (!$stock || !$stock['ativo'] || ($stock['tipo'] === 'peca' && (int) $stock['quantidade_atual'] < $difference))) {
+                return response()->json(['message' => 'Saldo de estoque insuficiente ou item arquivado.'], 409);
+            }
+            $adjustments[] = ['id' => (int) $stockId, 'qtd' => $difference];
+        }
+
+        $stockAdjustmentApplied = false;
+        if ($adjustments) {
+            $services->ajustarEstoque($adjustments, (string) \Illuminate\Support\Str::uuid());
+            $stockAdjustmentApplied = true;
+        }
+
+        try {
+        DB::transaction(function () use ($os, $request, $id, $clientId, $carId, $employeeId, $total, $client, $vehicle, $employee, $itensEnviados, $stockById) {
         $os->update([
-            'clientid'     => $request->input('clientid'),
-            'carid'        => $request->input('carid'),
+            'clientid'     => $clientId,
+            'carid'        => $carId,
             'sintomas'     => $request->input('sintomas'),
-            'funcid'       => $request->input('funcid'),
-            'valor_total'  => $request->input('valor_total'),
+            'funcid'       => $employeeId,
+            'valor_total'  => $total,
+            'cliente_nome_snapshot' => $client['nome'],
+            'cliente_email_snapshot' => $client['email'] ?? null,
+            'veiculo_modelo_snapshot' => $vehicle['modelo'],
+            'veiculo_placa_snapshot' => $vehicle['placa'],
+            'funcionario_nome_snapshot' => $employee['nome'],
         ]);
 
         if ($request->has('itens')) {
-            $itensEnviados = $request->itens;
             $idsEnviados = [];
 
-            foreach ($itensEnviados as $itemJson) {
-                $item = is_array($itemJson) ? $itemJson : json_decode($itemJson, true);
+            foreach ($itensEnviados as $item) {
                 $estoqid = $item['id'];
                 $idsEnviados[] = $estoqid;
+                $preco = $stockById[$estoqid]['valor_venda'];
+                $descricao = $stockById[$estoqid]['descricao'];
 
                 $itemExistente = DB::table('os_itens')
                     ->where('osid', $id)
@@ -148,8 +270,9 @@ class OrdemServicoController extends Controller
                         ->where('estoqid', $estoqid)
                         ->update([
                             'quantidade'     => $item['qtd'],
-                            'valor_unitario' => $item['preco'],
-                            'subtotal'       => $item['qtd'] * $item['preco'],
+                            'valor_unitario' => $preco,
+                            'subtotal'       => $item['qtd'] * $preco,
+                            'descricao_snapshot' => $descricao,
                             'updated_at'     => now()
                         ]);
                 } else {
@@ -157,8 +280,9 @@ class OrdemServicoController extends Controller
                         'osid'           => $id,
                         'estoqid'        => $estoqid,
                         'quantidade'     => $item['qtd'],
-                        'valor_unitario' => $item['preco'],
-                        'subtotal'       => $item['qtd'] * $item['preco'],
+                        'valor_unitario' => $preco,
+                        'subtotal'       => $item['qtd'] * $preco,
+                        'descricao_snapshot' => $descricao,
                         'created_at'     => now(),
                         'updated_at'     => now()
                     ]);
@@ -170,30 +294,39 @@ class OrdemServicoController extends Controller
                 ->whereNotIn('estoqid', $idsEnviados)
                 ->delete();
         }
+        });
+        } catch (\Throwable $exception) {
+            if ($stockAdjustmentApplied) {
+                try {
+                    $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $adjustments), (string) \Illuminate\Support\Str::uuid());
+                } catch (\Throwable $compensationFailure) {
+                    \Illuminate\Support\Facades\Log::error('Falha ao compensar ajuste de estoque da OS ' . $id, [
+                        'correlation_id' => request()->attributes->get('correlation_id'),
+                    ]);
+                }
+            }
+            throw $exception;
+        }
 
         return response()->json(['message' => 'Atualizado com sucesso!']);
     }
 
     public function listarRecebidos()
     {
-        $os = OrdemServico::join('clientes', 'clientes.clientid', '=', 'os.clientid')
-            ->join('veiculos', 'veiculos.carid', '=', 'os.carid')
-            ->join('funcionarios', 'funcionarios.funcid', '=', 'os.funcid')
-            ->whereIn('os.statid_atual', [OsStatusInterface::RECEBIDA[1], OsStatusInterface::EM_DIAGNOSTICO[1]])
-            ->get(['os.*', 'clientes.nome as nome_cliente', 'veiculos.modelo', 'funcionarios.nome as nome_funcionario']);
+        $os = $this->listarComSnapshots(OrdemServico::whereIn('statid_atual', [OsStatusInterface::RECEBIDA[1], OsStatusInterface::EM_DIAGNOSTICO[1]]));
         return response()->json($os);
     }
 
     public function emDiagnostico(string $id)
     {
-        $os = OrdemServico::where('osid', $id)
-            ->update([
+        $registro = OrdemServico::where('osid', $id)->first();
+        $os = $registro?->update([
                 'status_atual' => OsStatusInterface::EM_DIAGNOSTICO[0],
                 'statid_atual' => OsStatusInterface::EM_DIAGNOSTICO[1]
             ]);
 
         try {
-            $emailDestinatario = $os->cliente->email ?? 'cliente.teste@mwssandbox.com';
+            $emailDestinatario = $registro?->cliente_email_snapshot ?? 'cliente.teste@mwssandbox.com';
 
             Mail::to($emailDestinatario)->send(new OrcamentoEmDiagnostico($id));
         } catch (\Exception $e) {
@@ -208,77 +341,112 @@ class OrdemServicoController extends Controller
 
     public function analiseOs(Request $request, $id)
     {
-            $os = OrdemServico::where('osid', $id)->lockForUpdate()->first();
+        $os = OrdemServico::where('osid', $id)->first();
+        if (!$os) return response()->json(['message' => "OS $id não encontrada"], 404);
 
-            if (!$os) {
-                return response()->json(['message' => "OS $id não encontrada"], 404);
-            }
-
-            $os->update([
-                'analise'      => $request->input('analise'),
-                'status_atual' => OsStatusInterface::AGUARDANDO_APROVACAO[0],
-                'statid_atual' => OsStatusInterface::AGUARDANDO_APROVACAO[1],
-                'valor_total'  => $request->input('valor_total')
+        $items = $request->has('itens')
+            ? collect($request->itens)->map(fn ($item) => is_array($item) ? $item : json_decode($item, true))
+            : $os->itens()->get()->map(fn ($item) => [
+                'id' => $item->estoqid, 'qtd' => $item->quantidade,
+                'preco' => $item->valor_unitario,
             ]);
+        if ($items->isEmpty() || $items->contains(fn ($item) => !is_array($item)
+            || empty($item['id']) || !is_numeric($item['qtd'] ?? null)
+            || (int) $item['qtd'] <= 0 || (float) $item['qtd'] !== (float) (int) $item['qtd']
+            || !is_numeric($item['preco'] ?? null) || (float) $item['preco'] < 0)) {
+            return response()->json(['message' => 'Itens de orçamento inválidos.'], 422);
+        }
+        $items = $items->groupBy('id')->map(fn ($group, $itemId) => [
+            'id' => (int) $itemId,
+            'qtd' => $group->sum('qtd'),
+            'preco' => (float) $group->last()['preco'],
+        ])->values();
 
-            try {
-                $emailDestinatario = $os->cliente->email ?? 'cliente.teste@mwssandbox.com';
-
-                Mail::to($emailDestinatario)->send(new OrcamentoAguardandoAprovacao($os));
-            } catch (\Exception $e) {
-                \Illuminate\Support\Facades\Log::error("Erro ao registrar disparo de e-mail para OS {$id}: " . $e->getMessage());
+        $stockIds = $items->pluck('id')->all();
+        $stockResponse = app(ServicoInterno::class)->consultar('estoque', '/api/internal/v1/itens-estoque', [
+            'ids' => $stockIds, 'include_archived' => true,
+        ]);
+        if (count($stockResponse) !== count($stockIds)) {
+            return response()->json(['message' => 'Item de estoque não encontrado.'], 422);
+        }
+        $stockById = collect($stockResponse)->keyBy('estoqid');
+        $currentById = $os->itens()->get()->groupBy('estoqid')->map(fn ($group) => $group->sum('quantidade'));
+        $desiredById = $items->keyBy('id')->map(fn ($item) => $item['qtd']);
+        $adjustments = [];
+        foreach ($currentById->keys()->merge($desiredById->keys())->unique() as $stockId) {
+            $difference = (int) $desiredById->get($stockId, 0) - (int) $currentById->get($stockId, 0);
+            if ($difference === 0) continue;
+            $stock = $stockById[$stockId] ?? null;
+            if ($difference > 0 && (!$stock || !$stock['ativo']
+                || ($stock['tipo'] === 'peca' && (int) $stock['quantidade_atual'] < $difference))) {
+                return response()->json(['message' => 'Saldo de estoque insuficiente ou item arquivado.'], 409);
             }
+            $adjustments[] = ['id' => (int) $stockId, 'qtd' => $difference];
+        }
 
-            if ($request->has('itens')) {
-                $itensEnviados = $request->itens;
-                $idsEnviados = [];
+        $services = app(ServicoInterno::class);
+        $stockAdjustmentApplied = false;
+        if ($adjustments) {
+            $services->ajustarEstoque($adjustments, (string) \Illuminate\Support\Str::uuid());
+            $stockAdjustmentApplied = true;
+        }
 
-                foreach ($itensEnviados as $itemJson) {
-                    $item = is_array($itemJson) ? $itemJson : json_decode($itemJson, true);
-                    $estoqid = $item['id'];
-                    $idsEnviados[] = $estoqid;
-
-                    DB::table('os_itens')->updateOrInsert(
-                        ['osid' => $id, 'estoqid' => $estoqid],
-                        [
-                            'quantidade'     => $item['qtd'],
-                            'valor_unitario' => $item['preco'],
-                            'subtotal'       => $item['qtd'] * $item['preco'],
-                            'updated_at'     => now(),
-                            'created_at'     => DB::raw('IFNULL(created_at, NOW())')
-                        ]
-                    );
+        try {
+            DB::transaction(function () use ($os, $items, $stockById, $request, $id) {
+                $os->update([
+                    'analise' => $request->input('analise'),
+                    'status_atual' => OsStatusInterface::AGUARDANDO_APROVACAO[0],
+                    'statid_atual' => OsStatusInterface::AGUARDANDO_APROVACAO[1],
+                    'valor_total' => $request->input('valor_total', $items->sum(fn ($item) => $item['qtd'] * $item['preco'])),
+                ]);
+                $os->itens()->delete();
+                foreach ($items as $item) {
+                    $os->itens()->create([
+                        'estoqid' => $item['id'], 'quantidade' => $item['qtd'],
+                        'valor_unitario' => $item['preco'],
+                        'subtotal' => $item['qtd'] * $item['preco'],
+                        'descricao_snapshot' => $stockById[$item['id']]['descricao'],
+                    ]);
                 }
-
-                DB::table('os_itens')
-                    ->where('osid', $id)
-                    ->whereNotIn('estoqid', $idsEnviados)
-                    ->delete();
+            });
+        } catch (\Throwable $exception) {
+            if ($stockAdjustmentApplied) {
+                try {
+                    $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $adjustments), (string) \Illuminate\Support\Str::uuid());
+                } catch (\Throwable $compensationFailure) {
+                    \Illuminate\Support\Facades\Log::error('Falha ao compensar ajuste de estoque da OS ' . $id, [
+                        'correlation_id' => request()->attributes->get('correlation_id'),
+                    ]);
+                }
             }
+            throw $exception;
+        }
 
-            return response()->json(['message' => 'Análise finalizada e enviada para aprovação!']);
+        try {
+            Mail::to($os->cliente_email_snapshot ?? 'cliente.teste@mwssandbox.com')
+                ->send(new OrcamentoAguardandoAprovacao($os->refresh()));
+        } catch (\Exception $exception) {
+            \Illuminate\Support\Facades\Log::error("Erro ao registrar disparo de e-mail para OS {$id}: " . $exception->getMessage());
+        }
+        return response()->json(['message' => 'Análise finalizada e enviada para aprovação!']);
     }
 
     public function listarAguardandoAprovacao()
     {
-        $os = OrdemServico::join('clientes', 'clientes.clientid', '=', 'os.clientid')
-            ->join('veiculos', 'veiculos.carid', '=', 'os.carid')
-            ->join('funcionarios', 'funcionarios.funcid', '=', 'os.funcid')
-            ->whereIn('os.statid_atual', [OsStatusInterface::AGUARDANDO_APROVACAO[1]])
-            ->get(['os.*', 'clientes.nome as nome_cliente', 'veiculos.modelo', 'funcionarios.nome as nome_funcionario']);
+        $os = $this->listarComSnapshots(OrdemServico::where('statid_atual', OsStatusInterface::AGUARDANDO_APROVACAO[1]));
         return response()->json($os);
     }
 
     public function aprovarOs($id)
     {
-        $os = OrdemServico::where('osid', $id)
-            ->update([
+        $registro = OrdemServico::where('osid', $id)->first();
+        $os = $registro?->update([
                 'status_atual' => OsStatusInterface::EM_EXECUCAO[0],
                 'statid_atual' => OsStatusInterface::EM_EXECUCAO[1]
             ]);
 
         try {
-            $emailDestinatario = $os->cliente->email ?? 'cliente.teste@mwssandbox.com';
+            $emailDestinatario = $registro?->cliente_email_snapshot ?? 'cliente.teste@mwssandbox.com';
 
             Mail::to($emailDestinatario)->send(new OrcamentoAprovado($id));
         } catch (\Exception $e) {
@@ -293,14 +461,14 @@ class OrdemServicoController extends Controller
 
     public function finalizarOs(string $id)
     {
-        $os = OrdemServico::where('osid', $id)
-            ->update([
+        $registro = OrdemServico::where('osid', $id)->first();
+        $os = $registro?->update([
                 'status_atual' => OsStatusInterface::FINALIZADO[0],
                 'statid_atual' => OsStatusInterface::FINALIZADO[1]
             ]);
 
         try {
-            $emailDestinatario = $os->cliente->email ?? 'cliente.teste@mwssandbox.com';
+            $emailDestinatario = $registro?->cliente_email_snapshot ?? 'cliente.teste@mwssandbox.com';
 
             Mail::to($emailDestinatario)->send(new OrcamentoFinalizado($id));
         } catch (\Exception $e) {
@@ -330,12 +498,7 @@ class OrdemServicoController extends Controller
 
     public function listarExecucao()
     {
-        $os = OrdemServico::join('clientes', 'clientes.clientid', '=', 'os.clientid')
-            ->join('veiculos', 'veiculos.carid', '=', 'os.carid')
-            ->join('funcionarios', 'funcionarios.funcid', '=', 'os.funcid')
-            ->whereIn('os.statid_atual', [OsStatusInterface::EM_EXECUCAO[1], OsStatusInterface::FINALIZADO[1]])
-            ->Where('entregue', 0)
-            ->get(['os.*', 'clientes.nome as nome_cliente', 'veiculos.modelo', 'funcionarios.nome as nome_funcionario']);
+        $os = $this->listarComSnapshots(OrdemServico::whereIn('statid_atual', [OsStatusInterface::EM_EXECUCAO[1], OsStatusInterface::FINALIZADO[1]])->where('entregue', 0));
         return response()->json($os);
     }
 
@@ -372,7 +535,7 @@ class OrdemServicoController extends Controller
             ]);
 
         try {
-            $emailDestinatario = $os->cliente->email ?? 'cliente.teste@mwssandbox.com';
+            $emailDestinatario = $os->cliente_email_snapshot ?? 'cliente.teste@mwssandbox.com';
 
             Mail::to($emailDestinatario)->send(new OrcamentoAprovado($id));
         } catch (\Exception $e) {
@@ -408,10 +571,20 @@ class OrdemServicoController extends Controller
 
     public function verificarOsCliente(string $cpf)
     {
-        $os = OrdemServico::join('clientes', 'clientes.clientid', '=', 'os.clientid')
-            ->join('veiculos', 'veiculos.carid', '=', 'os.carid')
-            ->where('clientes.cpf', $cpf)
-            ->get(['os.*', 'clientes.nome as nome_cliente', 'veiculos.modelo']);
+        $clientes = app(ServicoInterno::class)->consultar('cliente', '/api/internal/v1/clientes', ['cpf' => $cpf]);
+        $ids = collect($clientes)->pluck('clientid')->all();
+        $os = $this->listarComSnapshots(OrdemServico::whereIn('clientid', $ids));
         return response()->json($os);
+    }
+
+    private function listarComSnapshots($query)
+    {
+        return $query->get()->each(function ($os) {
+            $os->nome_cliente = $os->cliente_nome_snapshot;
+            $os->modelo = $os->veiculo_modelo_snapshot;
+            $os->placa = $os->veiculo_placa_snapshot;
+            $os->nome_funcionario = $os->funcionario_nome_snapshot;
+            $os->nome_mecanico = $os->funcionario_nome_snapshot;
+        });
     }
 }

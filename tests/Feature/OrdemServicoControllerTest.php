@@ -5,9 +5,8 @@ namespace Tests\Feature;
 use App\Models\OrdemServico;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
-use Laravel\Sanctum\Sanctum;
-use App\Models\Funcionario;
 
 class OrdemServicoControllerTest extends TestCase
 {
@@ -17,86 +16,28 @@ class OrdemServicoControllerTest extends TestCase
         parent::setUp();
 
         $this->withoutMiddleware();
-
-        DB::statement('DROP TABLE IF EXISTS os_itens');
-        DB::statement('DROP TABLE IF EXISTS os');
-
-        DB::statement('CREATE TABLE clientes (
-        clientid INTEGER PRIMARY KEY,
-        nome TEXT
-        )');
-
-        DB::statement('CREATE TABLE veiculos (
-        carid INTEGER PRIMARY KEY,
-        modelo TEXT,
-        placa TEXT
-        )');
-
-        DB::statement('CREATE TABLE estoque (
-        estoqid INTEGER PRIMARY KEY,
-        descricao TEXT
-        )');
-
-        DB::statement('CREATE TABLE os (
-        osid INTEGER PRIMARY KEY AUTOINCREMENT,
-        clientid INTEGER,
-        carid INTEGER,
-        funcid INTEGER,
-        sintomas TEXT,
-        analise TEXT,
-        status_atual TEXT,
-        statid_atual INTEGER,
-        valor_total DECIMAL(10,2),
-        entregue INTEGER DEFAULT 0,
-        created_at TIMESTAMP,
-        updated_at TIMESTAMP
-        )');
-
-        DB::statement('CREATE TABLE os_itens (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        osid INTEGER,
-        estoqid INTEGER,
-        quantidade INTEGER,
-        valor_unitario DECIMAL(10,2),
-        subtotal DECIMAL(10,2),
-        created_at TIMESTAMP,
-        updated_at TIMESTAMP
-        )');
-
-
-        DB::table('clientes')->insert([
-            'clientid' => 1,
-            'nome' => 'Gustavo Pirolo'
-        ]);
-
-        DB::table('veiculos')->insert([
-            'carid' => 1,
-            'modelo' => 'Golf GTI',
-            'placa' => 'ABC-1234'
-        ]);
-
-        DB::table('funcionarios')->insert([
-            'funcid' => 1,
-            'nome' => 'Mecânico Claudio',
-            'cargo' => 'Mecânico',
-            'usr' => 'claudio',
-            'password' => bcrypt('123')
-        ]);
-
-        DB::table('estoque')->insert([
-            'estoqid' => 1,
-            'descricao' => 'Amortecedor'
-        ]);
-
-
-        $funcionario = Funcionario::create([
-            'nome' => 'Administrador',
-            'cargo' => 'Gerente',
-            'usr' => 'admin',
-            'password' => bcrypt('123')
-        ]);
-
-        Sanctum::actingAs($funcionario);
+        config(['services.internal' => [
+            'cliente' => 'http://cliente.test',
+            'veiculo' => 'http://veiculo.test',
+            'funcionario' => 'http://funcionario.test',
+            'estoque' => 'http://estoque.test',
+        ]]);
+        Http::fake(function ($request) {
+            $url = $request->url();
+            if (str_contains($url, '/api/internal/v1/clientes')) {
+                return Http::response([['clientid' => 1, 'nome' => 'Gustavo Pirolo', 'email' => 'gustavo@example.test']], 200);
+            }
+            if (str_contains($url, '/api/internal/v1/veiculos')) {
+                return Http::response([['carid' => 1, 'clientid' => 1, 'modelo' => 'Golf GTI', 'placa' => 'ABC-1234']], 200);
+            }
+            if (str_contains($url, '/api/internal/v1/funcionarios')) {
+                return Http::response([['funcid' => 1, 'nome' => 'Mecânico Claudio', 'cargo' => 'Mecânico']], 200);
+            }
+            if (str_contains($url, '/api/internal/v1/itens-estoque')) {
+                return Http::response([['estoqid' => 1, 'descricao' => 'Amortecedor', 'tipo' => 'peca', 'quantidade_atual' => 10, 'valor_venda' => 250, 'ativo' => true]], 200);
+            }
+            return Http::response(['message' => 'Estoque ajustado com sucesso.'], 200);
+        });
     }
 
     /** @test */
@@ -123,11 +64,13 @@ class OrdemServicoControllerTest extends TestCase
     }
 
     /** @test */
-    public function test_deve_listar_ordens_de_servico_com_joins()
+    public function test_deve_listar_ordens_de_servico_com_dados_historicos()
     {
         $os = OrdemServico::create([
             'clientid' => 1, 'carid' => 1, 'funcid' => 1,
-            'status_atual' => 'Recebida', 'statid_atual' => 1, 'valor_total' => 100
+            'status_atual' => 'Recebida', 'statid_atual' => 1, 'valor_total' => 100,
+            'cliente_nome_snapshot' => 'Gustavo Pirolo',
+            'veiculo_modelo_snapshot' => 'Golf GTI',
         ]);
 
         $response = $this->getJson('/api/os/listar');
@@ -162,7 +105,7 @@ class OrdemServicoControllerTest extends TestCase
         ]);
 
         DB::table('os_itens')->insert([
-            'osid' => $os->osid, 'estoqid' => 1, 'quantidade' => 1, 'valor_unitario' => 10
+            'osid' => $os->osid, 'estoqid' => 1, 'quantidade' => 1, 'valor_unitario' => 10, 'subtotal' => 10
         ]);
 
         $response = $this->postJson("/api/os/deletarOs/{$os->osid}");
