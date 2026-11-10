@@ -6,6 +6,7 @@ use App\Models\OrdemServico;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Mail;
 use Tests\TestCase;
 
 class OrdemServicoControllerTest extends TestCase
@@ -61,6 +62,48 @@ class OrdemServicoControllerTest extends TestCase
 
         $this->assertDatabaseHas('os', ['clientid' => 1, 'status_atual' => 'Recebida']);
         $this->assertDatabaseHas('os_itens', ['osid' => $response['osid'], 'estoqid' => 1]);
+    }
+
+    /**
+     * BDD: Given valid references and available stock, when the workshop
+     * completes the OS lifecycle, then every state transition is persisted.
+     */
+    public function test_bdd_fluxo_completo_da_os_da_abertura_a_entrega(): void
+    {
+        Mail::fake();
+
+        // Given: client, vehicle, mechanic and stock are available (faked by setUp).
+        // When: open the service order.
+        $opened = $this->postJson('/api/os/salvar', [
+            'clientid' => 1,
+            'carid' => 1,
+            'funcid' => 1,
+            'sintomas' => 'Ruído na suspensão',
+            'itens' => [['id' => 1, 'qtd' => 1]],
+        ]);
+        $opened->assertCreated();
+        $osid = $opened->json('osid');
+
+        // And: diagnose the vehicle and submit an estimate for customer approval.
+        $this->postJson("/api/os/emDiagnostico/{$osid}")->assertOk();
+        $this->postJson("/api/os/analiseOs/{$osid}", [
+            'analise' => 'Troca do amortecedor',
+            'itens' => [['id' => 1, 'qtd' => 1, 'preco' => 250]],
+        ])->assertOk();
+
+        // And: customer approves; the workshop finishes and delivers the OS.
+        $this->postJson("/api/os/aprovarOsUsuario/{$osid}")->assertOk();
+        $this->postJson("/api/os/finalizarOs/{$osid}")->assertOk();
+        $this->postJson("/api/os/entregar/{$osid}")->assertOk();
+
+        // Then: final state and item history are retained.
+        $this->assertDatabaseHas('os', [
+            'osid' => $osid,
+            'status_atual' => 'Entregue',
+            'statid_atual' => 6,
+            'entregue' => 1,
+        ]);
+        $this->assertDatabaseHas('os_itens', ['osid' => $osid, 'estoqid' => 1, 'quantidade' => 1]);
     }
 
     /** @test */
