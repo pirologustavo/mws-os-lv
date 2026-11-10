@@ -504,19 +504,39 @@ class OrdemServicoController extends Controller
 
     public function deletarOs(string $id)
     {
-        return DB::transaction(function () use ($id) {
-            $os = OrdemServico::where('osid', $id)->first();
+        $os = OrdemServico::where('osid', $id)->first();
+        if (!$os) return response()->json(['message' => 'OS não encontrada'], 404);
 
-            if (!$os) {
-                return response()->json(['message' => 'OS não encontrada'], 404);
+        $itens = $os->itens()->get()->groupBy('estoqid')->map(fn ($group, $estoqueId) => [
+            'id' => (int) $estoqueId, 'qtd' => (int) $group->sum('quantidade'),
+        ])->values()->all();
+        $services = app(ServicoInterno::class);
+        $restockApplied = false;
+        if ($itens) {
+            $services->ajustarEstoque($itens, (string) \Illuminate\Support\Str::uuid());
+            $restockApplied = true;
+        }
+
+        try {
+            DB::transaction(function () use ($os) {
+                $os->itens()->delete();
+                $os->historicoStatus()->delete();
+                $os->delete();
+            });
+        } catch (\Throwable $exception) {
+            if ($restockApplied) {
+                try {
+                    $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $itens), (string) \Illuminate\Support\Str::uuid());
+                } catch (\Throwable $compensationFailure) {
+                    \Illuminate\Support\Facades\Log::critical('Falha ao compensar devolução de estoque na exclusão da OS ' . $id, [
+                        'correlation_id' => request()->attributes->get('correlation_id'),
+                    ]);
+                }
             }
+            throw $exception;
+        }
 
-            $os->itens()->delete();
-            $os->historicoStatus()->delete();
-            $os->delete();
-
-            return response()->json(['message' => "OS #$id e seus vínculos foram excluídos com sucesso"]);
-        });
+        return response()->json(['message' => "OS #$id e seus vínculos foram excluídos com sucesso"]);
     }
 
     public function aprovarOsUsuario($id)
@@ -558,10 +578,39 @@ class OrdemServicoController extends Controller
             ], 404);
         }
 
-        $os->update([
-            'status_atual' => OsStatusInterface::CANCELADO[0],
-            'statid_atual' => OsStatusInterface::CANCELADO[1]
-        ]);
+        if ((int) $os->statid_atual === OsStatusInterface::CANCELADO[1]) {
+            return response()->json(['sucesso' => true, 'message' => 'OS já cancelada']);
+        }
+
+        $itens = $os->itens()->get()->groupBy('estoqid')->map(fn ($group, $estoqueId) => [
+            'id' => (int) $estoqueId, 'qtd' => (int) $group->sum('quantidade'),
+        ])->values()->all();
+        $services = app(ServicoInterno::class);
+        $restockApplied = false;
+        if ($itens) {
+            $services->ajustarEstoque($itens, (string) \Illuminate\Support\Str::uuid());
+            $restockApplied = true;
+        }
+
+        try {
+            DB::transaction(function () use ($os) {
+                $os->update([
+                    'status_atual' => OsStatusInterface::CANCELADO[0],
+                    'statid_atual' => OsStatusInterface::CANCELADO[1]
+                ]);
+            });
+        } catch (\Throwable $exception) {
+            if ($restockApplied) {
+                try {
+                    $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $itens), (string) \Illuminate\Support\Str::uuid());
+                } catch (\Throwable $compensationFailure) {
+                    \Illuminate\Support\Facades\Log::critical('Falha ao compensar devolução de estoque no cancelamento da OS ' . $id, [
+                        'correlation_id' => request()->attributes->get('correlation_id'),
+                    ]);
+                }
+            }
+            throw $exception;
+        }
 
         return response()->json([
             'sucesso' => true,
