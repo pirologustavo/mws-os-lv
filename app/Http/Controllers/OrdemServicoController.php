@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\Mail;
 use App\Mail\OrcamentoAguardandoAprovacao;
 use App\Mail\OrcamentoAprovado;
 use App\Http\Service\ServicoInterno;
+use App\Support\DogStatsD;
 
 class OrdemServicoController extends Controller
 {
@@ -124,6 +125,7 @@ class OrdemServicoController extends Controller
                 'id' => (int) $item['id'], 'qtd' => (int) $item['qtd'],
             ])->all(), $idempotencyKey);
         } catch (\Throwable $exception) {
+            DogStatsD::metric('mws.os.processing.failures', 1, 'c', ['service' => 'os-lv', 'operation' => 'create']);
             DB::transaction(function () use ($osid) {
                 $os = OrdemServico::where('osid', $osid)->first();
                 if ($os) {
@@ -296,6 +298,7 @@ class OrdemServicoController extends Controller
         }
         });
         } catch (\Throwable $exception) {
+            DogStatsD::metric('mws.os.processing.failures', 1, 'c', ['service' => 'os-lv', 'operation' => 'update']);
             if ($stockAdjustmentApplied) {
                 try {
                     $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $adjustments), (string) \Illuminate\Support\Str::uuid());
@@ -410,6 +413,7 @@ class OrdemServicoController extends Controller
                 }
             });
         } catch (\Throwable $exception) {
+            DogStatsD::metric('mws.os.processing.failures', 1, 'c', ['service' => 'os-lv', 'operation' => 'analysis']);
             if ($stockAdjustmentApplied) {
                 try {
                     $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $adjustments), (string) \Illuminate\Support\Str::uuid());
@@ -524,6 +528,7 @@ class OrdemServicoController extends Controller
                 $os->delete();
             });
         } catch (\Throwable $exception) {
+            DogStatsD::metric('mws.os.processing.failures', 1, 'c', ['service' => 'os-lv', 'operation' => 'delete']);
             if ($restockApplied) {
                 try {
                     $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $itens), (string) \Illuminate\Support\Str::uuid());
@@ -600,6 +605,7 @@ class OrdemServicoController extends Controller
                 ]);
             });
         } catch (\Throwable $exception) {
+            DogStatsD::metric('mws.os.processing.failures', 1, 'c', ['service' => 'os-lv', 'operation' => 'cancel']);
             if ($restockApplied) {
                 try {
                     $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $itens), (string) \Illuminate\Support\Str::uuid());

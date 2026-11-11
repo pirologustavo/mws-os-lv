@@ -4,6 +4,7 @@ namespace App\Http\Service;
 
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use App\Support\DogStatsD;
 use Illuminate\Http\Client\ConnectionException;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 
@@ -12,7 +13,10 @@ class ServicoInterno
     public function ajustarEstoque(array $itens, string $idempotencyKey): array
     {
         $baseUrl = (string) config('services.internal.estoque');
-        if ($baseUrl === '') throw new HttpException(503, 'Serviço de estoque não configurado.');
+        if ($baseUrl === '') {
+            DogStatsD::metric('mws.integration.errors', 1, 'c', ['service' => 'os-lv', 'dependency' => 'estoque']);
+            throw new HttpException(503, 'Serviço de estoque não configurado.');
+        }
         $request = request();
         $correlationId = $request->attributes->get('correlation_id')
             ?? $request->header('X-Correlation-ID')
@@ -31,6 +35,7 @@ class ServicoInterno
                 );
                 if ($response->serverError() && $attempt === 0) continue;
                 if (!$response->successful()) {
+                    DogStatsD::metric('mws.integration.errors', 1, 'c', ['service' => 'os-lv', 'dependency' => 'estoque']);
                     Log::warning('Falha em ajuste de estoque entre serviços', [
                         'status' => $response->status(), 'correlation_id' => $correlationId,
                     ]);
@@ -40,11 +45,13 @@ class ServicoInterno
                 return $response->json() ?? [];
             } catch (ConnectionException $exception) {
                 if ($attempt === 0) continue;
+                DogStatsD::metric('mws.integration.errors', 1, 'c', ['service' => 'os-lv', 'dependency' => 'estoque']);
                 Log::warning('Serviço de estoque inacessível durante ajuste', ['correlation_id' => $correlationId]);
                 throw new HttpException(503, 'Serviço de estoque indisponível.');
             } catch (HttpException $exception) {
                 throw $exception;
             } catch (\Throwable $exception) {
+                DogStatsD::metric('mws.integration.errors', 1, 'c', ['service' => 'os-lv', 'dependency' => 'estoque']);
                 Log::warning('Falha inesperada em ajuste de estoque', ['correlation_id' => $correlationId]);
                 throw new HttpException(503, 'Não foi possível ajustar o estoque.');
             }
@@ -66,6 +73,7 @@ class ServicoInterno
 
         $baseUrl = (string) config("services.internal.{$servico}");
         if ($baseUrl === '') {
+            DogStatsD::metric('mws.integration.errors', 1, 'c', ['service' => 'os-lv', 'dependency' => $servico]);
             throw new HttpException(503, 'Serviço dependente não configurado.');
         }
         $url = rtrim($baseUrl, '/') . $caminho;
@@ -86,6 +94,7 @@ class ServicoInterno
                 ->get($url, $parametros);
 
             if (!$response->successful()) {
+                DogStatsD::metric('mws.integration.errors', 1, 'c', ['service' => 'os-lv', 'dependency' => $servico]);
                 Log::warning('Falha em chamada entre serviços', [
                     'service' => $servico,
                     'status' => $response->status(),
@@ -98,6 +107,7 @@ class ServicoInterno
         } catch (HttpException $exception) {
             throw $exception;
         } catch (\Throwable $exception) {
+            DogStatsD::metric('mws.integration.errors', 1, 'c', ['service' => 'os-lv', 'dependency' => $servico]);
             Log::warning('Serviço interno inacessível', [
                 'service' => $servico,
                 'correlation_id' => $correlationId,
