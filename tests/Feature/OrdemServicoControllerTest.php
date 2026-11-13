@@ -8,6 +8,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Mail;
+use PHPUnit\Framework\Attributes\Group;
 use Tests\TestCase;
 
 class OrdemServicoControllerTest extends TestCase
@@ -69,6 +70,7 @@ class OrdemServicoControllerTest extends TestCase
      * BDD: Given valid references and available stock, when the workshop
      * completes the OS lifecycle, then every state transition is persisted.
      */
+    #[Group('bdd')]
     public function test_bdd_fluxo_completo_da_os_da_abertura_a_entrega(): void
     {
         Mail::fake();
