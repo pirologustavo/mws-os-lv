@@ -15,6 +15,8 @@ use App\Mail\OrcamentoAguardandoAprovacao;
 use App\Mail\OrcamentoAprovado;
 use App\Http\Service\ServicoInterno;
 use App\Support\DogStatsD;
+use App\Saga\SagaCoordinator;
+use App\Saga\Infrastructure\Outbox;
 
 class OrdemServicoController extends Controller
 {
@@ -81,7 +83,8 @@ class OrdemServicoController extends Controller
             $valorTotal += (float) $itemEstoque['valor_venda'] * (int) $item['qtd'];
         }
 
-        $osid = DB::transaction(function () use ($request, $cliente, $veiculo, $funcionario, $itensEntrada, $estoquePorId, $valorTotal) {
+        $correlationId = $this->correlationId();
+        $osid = DB::transaction(function () use ($request, $cliente, $veiculo, $funcionario, $itensEntrada, $estoquePorId, $valorTotal, $correlationId) {
 
             $os = OrdemServico::create([
                 'clientid'  => $request->clientid,
@@ -116,28 +119,25 @@ class OrdemServicoController extends Controller
                 'statid' => 1
             ]);
 
+            app(SagaCoordinator::class)->begin(
+                (int) $os->osid,
+                'create',
+                $itensEntrada->map(fn ($item) => ['id' => (int) $item['id'], 'qtd' => (int) $item['qtd']])->all(),
+                null,
+                $correlationId,
+            );
+            app(Outbox::class)->record('OSOpened', 'os.status.changed', 'OrdemServico', $os->osid, [
+                'osid' => (int) $os->osid, 'status' => OsStatusInterface::RECEBIDA[0],
+            ], $correlationId);
+
             return $os->osid;
         });
 
-        $idempotencyKey = (string) \Illuminate\Support\Str::uuid();
-        try {
-            $servicos->ajustarEstoque($itensEntrada->map(fn ($item) => [
-                'id' => (int) $item['id'], 'qtd' => (int) $item['qtd'],
-            ])->all(), $idempotencyKey);
-        } catch (\Throwable $exception) {
-            DogStatsD::metric('mws.os.processing.failures', 1, 'c', ['service' => 'os-lv', 'operation' => 'create']);
-            DB::transaction(function () use ($osid) {
-                $os = OrdemServico::where('osid', $osid)->first();
-                if ($os) {
-                    $os->itens()->delete();
-                    $os->historicoStatus()->delete();
-                    $os->delete();
-                }
-            });
-            throw $exception;
-        }
-
-        return response()->json(['message' => 'Ordem de Serviço criada com sucesso!', 'osid' => $osid], 201);
+        return response()->json([
+            'message' => 'Ordem recebida; reserva de estoque em processamento.',
+            'osid' => $osid,
+            'saga_status' => SagaCoordinator::PENDING,
+        ], 201);
     }
 
     public function listar()
@@ -166,6 +166,22 @@ class OrdemServicoController extends Controller
         return response()->json([
             'os' => $os,
             'itens' => $itens
+        ]);
+    }
+
+    public function estadoSaga(string $id)
+    {
+        $operation = DB::table('saga_operations')->where('osid', $id)->orderByDesc('created_at')->first();
+        if (!$operation) return response()->json(['osid' => (int) $id, 'saga_status' => SagaCoordinator::COMPLETED]);
+
+        return response()->json([
+            'osid' => (int) $id,
+            'saga_id' => $operation->id,
+            'operation' => $operation->operation,
+            'saga_status' => $operation->state,
+            'failure_reason' => $operation->failure_reason,
+            'correlation_id' => $operation->correlation_id,
+            'updated_at' => $operation->updated_at,
         ]);
     }
 
@@ -231,15 +247,11 @@ class OrdemServicoController extends Controller
             $adjustments[] = ['id' => (int) $stockId, 'qtd' => $difference];
         }
 
-        $stockAdjustmentApplied = false;
-        if ($adjustments) {
-            $services->ajustarEstoque($adjustments, (string) \Illuminate\Support\Str::uuid());
-            $stockAdjustmentApplied = true;
-        }
-
-        try {
-        DB::transaction(function () use ($os, $request, $id, $clientId, $carId, $employeeId, $total, $client, $vehicle, $employee, $itensEnviados, $stockById) {
-        $os->update([
+        $correlationId = $this->correlationId();
+        DB::transaction(function () use ($os, $request, $id, $clientId, $carId, $employeeId, $total, $client, $vehicle, $employee, $itensEnviados, $stockById, $adjustments, $correlationId) {
+        $locked = OrdemServico::where('osid', $id)->lockForUpdate()->firstOrFail();
+        $before = app(SagaCoordinator::class)->snapshot($locked);
+        $locked->update([
             'clientid'     => $clientId,
             'carid'        => $carId,
             'sintomas'     => $request->input('sintomas'),
@@ -296,37 +308,28 @@ class OrdemServicoController extends Controller
                 ->whereNotIn('estoqid', $idsEnviados)
                 ->delete();
         }
-        });
-        } catch (\Throwable $exception) {
-            DogStatsD::metric('mws.os.processing.failures', 1, 'c', ['service' => 'os-lv', 'operation' => 'update']);
-            if ($stockAdjustmentApplied) {
-                try {
-                    $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $adjustments), (string) \Illuminate\Support\Str::uuid());
-                } catch (\Throwable $compensationFailure) {
-                    \Illuminate\Support\Facades\Log::error('Falha ao compensar ajuste de estoque da OS ' . $id, [
-                        'correlation_id' => request()->attributes->get('correlation_id'),
-                    ]);
-                }
-            }
-            throw $exception;
+        if ($adjustments) {
+            app(SagaCoordinator::class)->begin((int) $id, 'update', $adjustments, $before, $correlationId);
         }
+        });
 
-        return response()->json(['message' => 'Atualizado com sucesso!']);
+        return response()->json([
+            'message' => $adjustments ? 'Atualização registrada; estoque em processamento.' : 'Atualizado com sucesso!',
+            'saga_status' => $adjustments ? SagaCoordinator::PENDING : SagaCoordinator::COMPLETED,
+        ], $adjustments ? 202 : 200);
     }
 
     public function listarRecebidos()
     {
-        $os = $this->listarComSnapshots(OrdemServico::whereIn('statid_atual', [OsStatusInterface::RECEBIDA[1], OsStatusInterface::EM_DIAGNOSTICO[1]]));
+        $os = $this->listarComSnapshots(OrdemServico::whereIn('statid_atual', [OsStatusInterface::RECEBIDA[1], OsStatusInterface::EM_DIAGNOSTICO[1]])
+            ->where('saga_status', SagaCoordinator::COMPLETED));
         return response()->json($os);
     }
 
     public function emDiagnostico(string $id)
     {
-        $registro = OrdemServico::where('osid', $id)->first();
-        $os = $registro?->update([
-                'status_atual' => OsStatusInterface::EM_DIAGNOSTICO[0],
-                'statid_atual' => OsStatusInterface::EM_DIAGNOSTICO[1]
-            ]);
+        $registro = $this->transitionStatus($id, OsStatusInterface::EM_DIAGNOSTICO);
+        $os = $registro ? 1 : 0;
 
         try {
             $emailDestinatario = $registro?->cliente_email_snapshot ?? 'cliente.teste@mwssandbox.com';
@@ -387,67 +390,56 @@ class OrdemServicoController extends Controller
             $adjustments[] = ['id' => (int) $stockId, 'qtd' => $difference];
         }
 
-        $services = app(ServicoInterno::class);
-        $stockAdjustmentApplied = false;
-        if ($adjustments) {
-            $services->ajustarEstoque($adjustments, (string) \Illuminate\Support\Str::uuid());
-            $stockAdjustmentApplied = true;
-        }
-
-        try {
-            DB::transaction(function () use ($os, $items, $stockById, $request, $id) {
-                $os->update([
+        $correlationId = $this->correlationId();
+        DB::transaction(function () use ($os, $items, $stockById, $request, $id, $adjustments, $correlationId) {
+                $locked = OrdemServico::where('osid', $id)->lockForUpdate()->firstOrFail();
+                $before = app(SagaCoordinator::class)->snapshot($locked);
+                $locked->update([
                     'analise' => $request->input('analise'),
                     'status_atual' => OsStatusInterface::AGUARDANDO_APROVACAO[0],
                     'statid_atual' => OsStatusInterface::AGUARDANDO_APROVACAO[1],
                     'valor_total' => $request->input('valor_total', $items->sum(fn ($item) => $item['qtd'] * $item['preco'])),
                 ]);
-                $os->itens()->delete();
+                $locked->itens()->delete();
                 foreach ($items as $item) {
-                    $os->itens()->create([
+                    $locked->itens()->create([
                         'estoqid' => $item['id'], 'quantidade' => $item['qtd'],
                         'valor_unitario' => $item['preco'],
                         'subtotal' => $item['qtd'] * $item['preco'],
                         'descricao_snapshot' => $stockById[$item['id']]['descricao'],
                     ]);
                 }
-            });
-        } catch (\Throwable $exception) {
-            DogStatsD::metric('mws.os.processing.failures', 1, 'c', ['service' => 'os-lv', 'operation' => 'analysis']);
-            if ($stockAdjustmentApplied) {
-                try {
-                    $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $adjustments), (string) \Illuminate\Support\Str::uuid());
-                } catch (\Throwable $compensationFailure) {
-                    \Illuminate\Support\Facades\Log::error('Falha ao compensar ajuste de estoque da OS ' . $id, [
-                        'correlation_id' => request()->attributes->get('correlation_id'),
-                    ]);
+                if ($adjustments) {
+                    app(SagaCoordinator::class)->begin((int) $id, 'analysis', $adjustments, $before, $correlationId);
                 }
+            });
+
+        if (!$adjustments) {
+            try {
+                Mail::to($os->cliente_email_snapshot ?? 'cliente.teste@mwssandbox.com')
+                    ->send(new OrcamentoAguardandoAprovacao($os->refresh()));
+            } catch (\Exception $exception) {
+                \Illuminate\Support\Facades\Log::error("Erro ao registrar disparo de e-mail para OS {$id}: " . $exception->getMessage());
             }
-            throw $exception;
         }
 
-        try {
-            Mail::to($os->cliente_email_snapshot ?? 'cliente.teste@mwssandbox.com')
-                ->send(new OrcamentoAguardandoAprovacao($os->refresh()));
-        } catch (\Exception $exception) {
-            \Illuminate\Support\Facades\Log::error("Erro ao registrar disparo de e-mail para OS {$id}: " . $exception->getMessage());
-        }
-        return response()->json(['message' => 'Análise finalizada e enviada para aprovação!']);
+        return response()->json([
+            'message' => $adjustments ? 'Análise registrada; estoque em processamento antes do envio ao cliente.' : 'Análise finalizada e enviada para aprovação!',
+            'saga_status' => $adjustments ? SagaCoordinator::PENDING : SagaCoordinator::COMPLETED,
+        ], $adjustments ? 202 : 200);
     }
 
     public function listarAguardandoAprovacao()
     {
-        $os = $this->listarComSnapshots(OrdemServico::where('statid_atual', OsStatusInterface::AGUARDANDO_APROVACAO[1]));
+        $os = $this->listarComSnapshots(OrdemServico::where('statid_atual', OsStatusInterface::AGUARDANDO_APROVACAO[1])
+            ->where('saga_status', SagaCoordinator::COMPLETED));
         return response()->json($os);
     }
 
     public function aprovarOs($id)
     {
-        $registro = OrdemServico::where('osid', $id)->first();
-        $os = $registro?->update([
-                'status_atual' => OsStatusInterface::EM_EXECUCAO[0],
-                'statid_atual' => OsStatusInterface::EM_EXECUCAO[1]
-            ]);
+        $registro = $this->transitionStatus($id, OsStatusInterface::EM_EXECUCAO);
+        $os = $registro ? 1 : 0;
 
         try {
             $emailDestinatario = $registro?->cliente_email_snapshot ?? 'cliente.teste@mwssandbox.com';
@@ -465,11 +457,8 @@ class OrdemServicoController extends Controller
 
     public function finalizarOs(string $id)
     {
-        $registro = OrdemServico::where('osid', $id)->first();
-        $os = $registro?->update([
-                'status_atual' => OsStatusInterface::FINALIZADO[0],
-                'statid_atual' => OsStatusInterface::FINALIZADO[1]
-            ]);
+        $registro = $this->transitionStatus($id, OsStatusInterface::FINALIZADO);
+        $os = $registro ? 1 : 0;
 
         try {
             $emailDestinatario = $registro?->cliente_email_snapshot ?? 'cliente.teste@mwssandbox.com';
@@ -487,12 +476,10 @@ class OrdemServicoController extends Controller
 
     public function entregarOs(string $id)
     {
-        $os = OrdemServico::where('osid', $id)
-            ->update([
-                'status_atual' => OsStatusInterface::ENTREGUE[0],
-                'statid_atual' => OsStatusInterface::ENTREGUE[1],
-                'entregue' => OrdemServicoInterface::ENTREGUE,
-            ]);
+        $registro = $this->transitionStatus($id, OsStatusInterface::ENTREGUE, [
+            'entregue' => OrdemServicoInterface::ENTREGUE,
+        ]);
+        $os = $registro ? 1 : 0;
 
         return response()->json([
             'sucesso' => $os > 0,
@@ -502,7 +489,8 @@ class OrdemServicoController extends Controller
 
     public function listarExecucao()
     {
-        $os = $this->listarComSnapshots(OrdemServico::whereIn('statid_atual', [OsStatusInterface::EM_EXECUCAO[1], OsStatusInterface::FINALIZADO[1]])->where('entregue', 0));
+        $os = $this->listarComSnapshots(OrdemServico::whereIn('statid_atual', [OsStatusInterface::EM_EXECUCAO[1], OsStatusInterface::FINALIZADO[1]])
+            ->where('entregue', 0)->where('saga_status', SagaCoordinator::COMPLETED));
         return response()->json($os);
     }
 
@@ -512,36 +500,29 @@ class OrdemServicoController extends Controller
         if (!$os) return response()->json(['message' => 'OS não encontrada'], 404);
 
         $itens = $os->itens()->get()->groupBy('estoqid')->map(fn ($group, $estoqueId) => [
-            'id' => (int) $estoqueId, 'qtd' => (int) $group->sum('quantidade'),
+            // Negative quantities represent inventory being returned to Stock.
+            'id' => (int) $estoqueId, 'qtd' => -(int) $group->sum('quantidade'),
         ])->values()->all();
-        $services = app(ServicoInterno::class);
-        $restockApplied = false;
-        if ($itens) {
-            $services->ajustarEstoque($itens, (string) \Illuminate\Support\Str::uuid());
-            $restockApplied = true;
-        }
-
-        try {
-            DB::transaction(function () use ($os) {
-                $os->itens()->delete();
-                $os->historicoStatus()->delete();
-                $os->delete();
+        if (!$itens) {
+            DB::transaction(function () use ($id): void {
+                DB::table('os_itens')->where('osid', $id)->delete();
+                DB::table('os_status')->where('osid', $id)->delete();
+                DB::table('os')->where('osid', $id)->delete();
             });
-        } catch (\Throwable $exception) {
-            DogStatsD::metric('mws.os.processing.failures', 1, 'c', ['service' => 'os-lv', 'operation' => 'delete']);
-            if ($restockApplied) {
-                try {
-                    $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $itens), (string) \Illuminate\Support\Str::uuid());
-                } catch (\Throwable $compensationFailure) {
-                    \Illuminate\Support\Facades\Log::critical('Falha ao compensar devolução de estoque na exclusão da OS ' . $id, [
-                        'correlation_id' => request()->attributes->get('correlation_id'),
-                    ]);
-                }
-            }
-            throw $exception;
+            return response()->json(['message' => "OS #$id excluída."]);
         }
 
-        return response()->json(['message' => "OS #$id e seus vínculos foram excluídos com sucesso"]);
+        $correlationId = $this->correlationId();
+        DB::transaction(function () use ($id, $itens, $correlationId): void {
+            $locked = OrdemServico::where('osid', $id)->lockForUpdate()->firstOrFail();
+            $before = app(SagaCoordinator::class)->snapshot($locked);
+            app(SagaCoordinator::class)->begin((int) $id, 'delete', $itens, $before, $correlationId);
+        });
+
+        return response()->json([
+            'message' => "Exclusão da OS #$id solicitada; devolução de estoque em processamento.",
+            'saga_status' => SagaCoordinator::PENDING,
+        ], 202);
     }
 
     public function aprovarOsUsuario($id)
@@ -554,10 +535,7 @@ class OrdemServicoController extends Controller
             ], 404);
         }
 
-        $os->update([
-                'status_atual' => OsStatusInterface::EM_EXECUCAO[0],
-                'statid_atual' => OsStatusInterface::EM_EXECUCAO[1]
-            ]);
+        $os = $this->transitionStatus($id, OsStatusInterface::EM_EXECUCAO);
 
         try {
             $emailDestinatario = $os->cliente_email_snapshot ?? 'cliente.teste@mwssandbox.com';
@@ -588,40 +566,30 @@ class OrdemServicoController extends Controller
         }
 
         $itens = $os->itens()->get()->groupBy('estoqid')->map(fn ($group, $estoqueId) => [
-            'id' => (int) $estoqueId, 'qtd' => (int) $group->sum('quantidade'),
+            'id' => (int) $estoqueId, 'qtd' => -(int) $group->sum('quantidade'),
         ])->values()->all();
-        $services = app(ServicoInterno::class);
-        $restockApplied = false;
-        if ($itens) {
-            $services->ajustarEstoque($itens, (string) \Illuminate\Support\Str::uuid());
-            $restockApplied = true;
-        }
-
-        try {
-            DB::transaction(function () use ($os) {
-                $os->update([
-                    'status_atual' => OsStatusInterface::CANCELADO[0],
-                    'statid_atual' => OsStatusInterface::CANCELADO[1]
-                ]);
-            });
-        } catch (\Throwable $exception) {
-            DogStatsD::metric('mws.os.processing.failures', 1, 'c', ['service' => 'os-lv', 'operation' => 'cancel']);
-            if ($restockApplied) {
-                try {
-                    $services->ajustarEstoque(array_map(fn ($item) => ['id' => $item['id'], 'qtd' => -$item['qtd']], $itens), (string) \Illuminate\Support\Str::uuid());
-                } catch (\Throwable $compensationFailure) {
-                    \Illuminate\Support\Facades\Log::critical('Falha ao compensar devolução de estoque no cancelamento da OS ' . $id, [
-                        'correlation_id' => request()->attributes->get('correlation_id'),
-                    ]);
-                }
+        $correlationId = $this->correlationId();
+        DB::transaction(function () use ($id, $itens, $correlationId): void {
+            $locked = OrdemServico::where('osid', $id)->lockForUpdate()->firstOrFail();
+            $before = app(SagaCoordinator::class)->snapshot($locked);
+            $locked->update([
+                'status_atual' => OsStatusInterface::CANCELADO[0],
+                'statid_atual' => OsStatusInterface::CANCELADO[1],
+            ]);
+            if ($itens) {
+                app(SagaCoordinator::class)->begin((int) $id, 'cancel', $itens, $before, $correlationId);
+            } else {
+                app(Outbox::class)->record('OSStatusChanged', 'os.status.changed', 'OrdemServico', $id, [
+                    'osid' => (int) $id, 'status' => OsStatusInterface::CANCELADO[0],
+                ], $correlationId);
             }
-            throw $exception;
-        }
+        });
 
         return response()->json([
             'sucesso' => true,
-            'message' => 'Status atualizado'
-        ]);
+            'message' => $itens ? 'Cancelamento e devolução de estoque em processamento.' : 'Status atualizado',
+            'saga_status' => $itens ? SagaCoordinator::PENDING : SagaCoordinator::COMPLETED,
+        ], $itens ? 202 : 200);
     }
 
     public function verificarOsCliente(string $cpf)
@@ -630,6 +598,32 @@ class OrdemServicoController extends Controller
         $ids = collect($clientes)->pluck('clientid')->all();
         $os = $this->listarComSnapshots(OrdemServico::whereIn('clientid', $ids));
         return response()->json($os);
+    }
+
+    private function transitionStatus(string $id, array $status, array $extra = []): ?OrdemServico
+    {
+        return DB::transaction(function () use ($id, $status, $extra): ?OrdemServico {
+            $os = OrdemServico::where('osid', $id)->lockForUpdate()->first();
+            if (!$os) return null;
+            abort_if($os->saga_status === SagaCoordinator::PENDING, 409, 'A OS aguarda a conclusão da Saga de estoque.');
+
+            $os->update(array_merge([
+                'status_atual' => $status[0], 'statid_atual' => $status[1],
+            ], $extra));
+
+            app(Outbox::class)->record('OSStatusChanged', 'os.status.changed', 'OrdemServico', $id, [
+                'osid' => (int) $id, 'status' => $status[0], 'statid' => $status[1],
+            ], $this->correlationId());
+
+            return $os->fresh();
+        });
+    }
+
+    private function correlationId(): string
+    {
+        return (string) (request()->attributes->get('correlation_id')
+            ?? request()->header('X-Correlation-ID')
+            ?? \Illuminate\Support\Str::uuid());
     }
 
     private function listarComSnapshots($query)

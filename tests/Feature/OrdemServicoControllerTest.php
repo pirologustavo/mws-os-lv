@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Models\OrdemServico;
+use App\Saga\StockAdjustmentResultHandler;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -83,6 +84,7 @@ class OrdemServicoControllerTest extends TestCase
         ]);
         $opened->assertCreated();
         $osid = $opened->json('osid');
+        $this->completePendingSaga($osid);
 
         // And: diagnose the vehicle and submit an estimate for customer approval.
         $this->postJson("/api/os/emDiagnostico/{$osid}")->assertOk();
@@ -104,6 +106,22 @@ class OrdemServicoControllerTest extends TestCase
             'entregue' => 1,
         ]);
         $this->assertDatabaseHas('os_itens', ['osid' => $osid, 'estoqid' => 1, 'quantidade' => 1]);
+    }
+
+    private function completePendingSaga(int $osid): void
+    {
+        $operation = DB::table('saga_operations')->where('osid', $osid)->where('state', 'PENDING')->latest()->first();
+        $this->assertNotNull($operation, 'A abertura da OS deve iniciar uma Saga pendente.');
+
+        app(StockAdjustmentResultHandler::class)->handle([
+            'event_id' => (string) \Illuminate\Support\Str::uuid(),
+            'event_type' => 'stock.adjustment.succeeded',
+            'saga_id' => $operation->id,
+            'operation_id' => $operation->id,
+            'osid' => $osid,
+            'request_event_id' => $operation->request_event_id,
+            'items' => [['id' => 1, 'qtd' => -1]],
+        ]);
     }
 
     /** @test */
