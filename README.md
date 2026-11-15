@@ -56,3 +56,11 @@ If you discover a security vulnerability within Laravel, please send an e-mail t
 ## License
 
 The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+
+## Entregáveis Fase 4
+
+[Arquitetura, execução e CI/CD](docs/ARCHITECTURE.md) · [API e autenticação](docs/API.md) · [Collection Postman](docs/api.postman_collection.json) · [Cobertura](docs/evidence/coverage.xml)
+
+### Cobrança e execução
+
+[Fluxo, Mercado Pago, recuperação e limites](docs/BILLING.md). O BDD inclui checkout e consulta de pagamento; relatório em [evidence/bdd.log](docs/evidence/bdd.log).
