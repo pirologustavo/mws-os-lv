@@ -2,6 +2,7 @@
 
 namespace Tests\Feature;
 
+use App\Jobs\SendEstimate;
 use App\Models\OrdemServico;
 use App\Saga\StockAdjustmentResultHandler;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -118,6 +119,41 @@ class OrdemServicoControllerTest extends TestCase
             'entregue' => 1,
         ]);
         $this->assertDatabaseHas('os_itens', ['osid' => $osid, 'estoqid' => 1, 'quantidade' => 1]);
+    }
+
+    public function test_timeout_waits_for_remote_compensation_and_ignores_late_success(): void
+    {
+        $opened = $this->postJson('/api/os/salvar', ['clientid' => 1, 'carid' => 1, 'funcid' => 1, 'itens' => [['id' => 1, 'qtd' => 1]]])->assertCreated();
+        $id = $opened['osid'];
+        $operation = DB::table('saga_operations')->where('osid', $id)->first();
+        DB::table('saga_operations')->where('id', $operation->id)->update(['updated_at' => now()->subMinutes(10)]);
+        $this->artisan('saga:report-stuck')->assertExitCode(0);
+        $event = ['event_id' => (string) Str::uuid(), 'event_type' => 'stock.adjustment.succeeded', 'operation_id' => $operation->id, 'saga_id' => $operation->id, 'osid' => $id, 'request_event_id' => $operation->request_event_id];
+        app(StockAdjustmentResultHandler::class)->handle($event);
+        $this->assertDatabaseHas('saga_operations', ['id' => $operation->id, 'state' => 'CANCELLING']);
+        $this->assertDatabaseHas('os', ['osid' => $id, 'saga_status' => 'PENDENTE']);
+        DB::table('saga_operations')->where('id', $operation->id)->update(['updated_at' => now()->subMinutes(10)]);
+        $this->artisan('saga:report-stuck')->assertExitCode(0);
+        $this->assertSame(1, DB::table('integration_outbox')->where('event_type', 'OSStockAdjustmentCancellationRequested')->count());
+        app(StockAdjustmentResultHandler::class)->handle(array_merge($event, ['event_id' => (string) Str::uuid(), 'event_type' => 'stock.adjustment.failed', 'cancelled' => true]));
+        $this->assertDatabaseHas('saga_operations', ['id' => $operation->id, 'state' => 'COMPENSATED']);
+        $this->assertDatabaseHas('os', ['osid' => $id, 'statid_atual' => 7, 'saga_status' => 'COMPENSADA']);
+    }
+
+    public function test_permanent_estimate_delivery_failure_requests_inventory_return_once(): void
+    {
+        $opened = $this->postJson('/api/os/salvar', ['clientid' => 1, 'carid' => 1, 'funcid' => 1, 'itens' => [['id' => 1, 'qtd' => 1]]])->assertCreated();
+        $id = $opened['osid'];
+        $this->completePendingSaga($id);
+        $this->postJson("/api/os/analiseOs/$id", ['analise' => 'Troca', 'itens' => [['id' => 1, 'qtd' => 1, 'preco' => 250]]])->assertOk();
+        $job = new SendEstimate($id);
+        $job->handle();
+        $job->failed(new \RuntimeException('SMTP indisponível'));
+        $job->failed(new \RuntimeException('Duplicada'));
+        $this->assertDatabaseHas('os', ['osid' => $id, 'statid_atual' => 7, 'saga_status' => 'PENDENTE']);
+        $this->assertSame(1, DB::table('saga_operations')->where('osid', $id)->where('operation', 'cancel')->count());
+        $this->completePendingSaga($id);
+        $this->assertDatabaseHas('os', ['osid' => $id, 'statid_atual' => 7, 'saga_status' => 'CONCLUIDA']);
     }
 
     private function completePendingSaga(int $osid): void
@@ -338,7 +374,7 @@ class OrdemServicoControllerTest extends TestCase
         DB::table('saga_operations')->update(['updated_at' => now()->subMinutes(10)]);
         $this->artisan('saga:report-stuck')->assertExitCode(0);
         $operation = DB::table('saga_operations')->first();
-        app(StockAdjustmentResultHandler::class)->handle(['event_id' => (string) Str::uuid(), 'event_type' => 'stock.adjustment.failed', 'saga_id' => $operation->id, 'operation_id' => $operation->id, 'osid' => $id, 'request_event_id' => $operation->request_event_id]);
+        app(StockAdjustmentResultHandler::class)->handle(['event_id' => (string) Str::uuid(), 'event_type' => 'stock.adjustment.failed', 'saga_id' => $operation->id, 'operation_id' => $operation->id, 'osid' => $id, 'request_event_id' => $operation->request_event_id, 'cancelled' => true]);
         $this->assertDatabaseHas('os', ['osid' => $id, 'saga_status' => 'COMPENSADA', 'statid_atual' => 7]);
     }
 
